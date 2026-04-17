@@ -2,19 +2,10 @@ import SwiftUI
 
 struct MenuBarView: View {
     @Bindable var monitor: SystemMonitor
-
-    private let intervals: [(label: String, value: TimeInterval)] = [
-        ("1s",  1),
-        ("3s",  3),
-        ("5s",  5),
-        ("10s", 10),
-        ("30s", 30),
-    ]
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-
-            // CPU
             HStack {
                 Label("CPU", systemImage: "cpu")
                     .font(.subheadline.weight(.medium))
@@ -41,7 +32,6 @@ struct MenuBarView: View {
 
             Divider()
 
-            // Memory
             HStack {
                 Text("Memory")
                     .font(.subheadline.weight(.medium))
@@ -60,36 +50,32 @@ struct MenuBarView: View {
 
             Divider()
 
-            // Refresh Interval
-            HStack {
-                Image(systemName: "arrow.clockwise")
-                    .foregroundStyle(.secondary)
-                Text("Refresh")
-                    .font(.subheadline)
-                Spacer()
-                Picker("", selection: $monitor.refreshInterval) {
-                    ForEach(intervals, id: \.value) { interval in
-                        Text(interval.label).tag(interval.value)
-                    }
+            HStack(spacing: 8) {
+                Button(action: {
+                    openWindow(id: "settings")
+                    NSApp.activate(ignoringOtherApps: true)
+                }) {
+                    Label("Settings…", systemImage: "gearshape")
+                        .font(.subheadline)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 8)
+                        .contentShape(Rectangle())
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 180)
-            }
-
-            Divider()
-
-            // Quit
-            HStack {
-                Spacer()
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
                 Button(action: {
                     NSApplication.shared.terminate(nil)
                 }) {
                     Label("Quit Antler", systemImage: "power")
                         .font(.subheadline)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 8)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                Spacer()
             }
         }
         .padding(14)

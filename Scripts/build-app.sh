@@ -40,13 +40,9 @@ sips -z 64 64 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32@2x.png" >/dev/null
 sips -z 128 128 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128.png" >/dev/null
 sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
 sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256.png" >/dev/null
-sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
-sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512.png" >/dev/null
-cp "$ICON_SOURCE" "$ICONSET_DIR/icon_512x512@2x.png"
 iconutil -c icns "$ICONSET_DIR" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 cp "$ROOT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$EXECUTABLE" "$APP_DIR/Contents/MacOS/Antler"
-codesign --force --sign - --identifier "com.jack.antler" "$APP_DIR"
 
 echo "Built app bundle at $APP_DIR"

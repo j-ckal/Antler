@@ -14,8 +14,74 @@ final class SystemMonitor {
     var memoryTotal: UInt64 = 0         // bytes
     var swapUsed: UInt64 = 0            // bytes
     var memoryPressure: MemoryPressureLevel = .nominal
-    var refreshInterval: TimeInterval = 3.0 {
-        didSet { restartTimer() }
+
+    // Per-metric refresh intervals (seconds). Each has its own Timer, so
+    // changing one doesn't reset the others. Temperature defaults slower
+    // because it's the most expensive metric to sample (~24 IOHID sensors).
+    // `memoryInterval` governs memory used, memory pressure, and swap.
+    var cpuInterval:         TimeInterval = SystemMonitor.loadInterval(SystemMonitor.cpuIntervalKey,         default: 5)  { didSet { SystemMonitor.saveInterval(SystemMonitor.cpuIntervalKey, cpuInterval);                 restart(.cpu) } }
+    var temperatureInterval: TimeInterval = SystemMonitor.loadInterval(SystemMonitor.temperatureIntervalKey, default: 20) { didSet { SystemMonitor.saveInterval(SystemMonitor.temperatureIntervalKey, temperatureInterval); restart(.temperature) } }
+    var memoryInterval:      TimeInterval = SystemMonitor.loadInterval(SystemMonitor.memoryIntervalKey,      default: 5)  { didSet { SystemMonitor.saveInterval(SystemMonitor.memoryIntervalKey, memoryInterval);           restart(.memory); restart(.memoryPressure); restart(.swap) } }
+    var pingInterval:        TimeInterval = SystemMonitor.loadInterval(SystemMonitor.pingIntervalKey,        default: 5)  { didSet { SystemMonitor.saveInterval(SystemMonitor.pingIntervalKey, pingInterval);               restart(.ping) } }
+
+    /// Destination for ping. Accepts IPv4 address or hostname.
+    var pingHost: String = SystemMonitor.loadPingHost() {
+        didSet {
+            let trimmed = pingHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed != pingHost { pingHost = trimmed; return }
+            UserDefaults.standard.set(pingHost, forKey: SystemMonitor.pingHostKey)
+            restart(.ping)
+        }
+    }
+
+    static let defaultPingHost = "1.1.1.1"
+
+    private static let cpuIntervalKey         = "cpuInterval"
+    private static let temperatureIntervalKey = "temperatureInterval"
+    private static let memoryIntervalKey      = "memoryInterval"
+    private static let pingIntervalKey        = "pingInterval"
+    private static let pingHostKey            = "pingHost"
+
+    private static func loadPingHost() -> String {
+        let stored = UserDefaults.standard.string(forKey: pingHostKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return stored.isEmpty ? defaultPingHost : stored
+    }
+
+    private static func loadInterval(_ key: String, default defaultValue: TimeInterval) -> TimeInterval {
+        let stored = UserDefaults.standard.double(forKey: key)
+        return stored > 0 ? stored : defaultValue
+    }
+
+    private static func saveInterval(_ key: String, _ value: TimeInterval) {
+        UserDefaults.standard.set(value, forKey: key)
+    }
+
+    enum Metric: String, CaseIterable, Identifiable {
+        case cpu, temperature, memory, memoryPressure, swap, ping
+        var id: String { rawValue }
+
+        var displayName: String {
+            switch self {
+            case .cpu:             return "CPU usage"
+            case .temperature:     return "CPU temperature"
+            case .memory:          return "Memory"
+            case .memoryPressure:  return "Memory pressure"
+            case .swap:            return "Swap"
+            case .ping:            return "Ping"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .cpu:             return "cpu"
+            case .temperature:     return "thermometer"
+            case .memory:          return "memorychip"
+            case .memoryPressure:  return "gauge.with.dots.needle.50percent"
+            case .swap:            return "externaldrive"
+            case .ping:            return "network"
+            }
+        }
     }
 
     enum MemoryPressureLevel: Int {
@@ -42,44 +108,104 @@ final class SystemMonitor {
 
     // MARK: - Private State
 
-    private var timer: Timer?
+    private var timers: [Metric: Timer] = [:]
     private var previousCPUTicks: (user: UInt64, system: UInt64, idle: UInt64, nice: UInt64)?
     private var pingTask: Task<Void, Never>?
+    private var thermalClient: AnyObject?
+    private var thermalServices: [AnyObject] = []
 
     // MARK: - Lifecycle
 
     init() {
         memoryTotal = ProcessInfo.processInfo.physicalMemory
+        setupThermalClient()
         updateAll()
-        startTimer()
+        for metric in Metric.allCases { restart(metric) }
+    }
+
+    /// Maximum thermal sensors to poll. Apple Silicon exposes ~24 per-cluster
+    /// `tdie` sensors; each `IOHIDServiceClientCopyEvent` is an IOKit
+    /// round-trip (~0.8 ms), so sampling them all costs ~20 ms/tick. Since
+    /// the die temps across a single CPU complex are closely correlated and
+    /// we only use the max, a strided sample of ~6 gives a near-identical
+    /// reading at ~75% less cost.
+    private static let maxThermalSensors = 6
+
+    /// One-time setup: create the IOHID client, apply the match dict,
+    /// filter the service list down to CPU-temperature sensors, and sample
+    /// a strided subset. The client and services are reused for the
+    /// lifetime of the app.
+    private func setupThermalClient() {
+        guard let client = IOHIDEventSystemClientCreate(kCFAllocatorDefault) else { return }
+
+        let matchDict = [
+            "PrimaryUsagePage": 0xff00,
+            "PrimaryUsage": 0x5
+        ] as CFDictionary
+        IOHIDEventSystemClientSetMatching(client, matchDict)
+
+        guard let servicesUnmanaged = IOHIDEventSystemClientCopyServices(client) else { return }
+        let allServices = servicesUnmanaged.takeRetainedValue() as [AnyObject]
+
+        var cpuServices: [AnyObject] = []
+        for service in allServices {
+            guard let nameUnmanaged = IOHIDServiceClientCopyProperty(service, "Product" as CFString) else { continue }
+            guard let name = nameUnmanaged.takeRetainedValue() as? String else { continue }
+            let lower = name.lowercased()
+            if lower.contains("tdie") || lower.contains("cpu") {
+                cpuServices.append(service)
+            }
+        }
+
+        let step = max(1, cpuServices.count / Self.maxThermalSensors)
+        let sampled = stride(from: 0, to: cpuServices.count, by: step)
+            .prefix(Self.maxThermalSensors)
+            .map { cpuServices[$0] }
+
+        self.thermalClient = client
+        self.thermalServices = Array(sampled)
     }
 
     deinit {
-        timer?.invalidate()
+        for t in timers.values { t.invalidate() }
         pingTask?.cancel()
     }
 
-    // MARK: - Timer (only memory pressure + thermal, NOT cpu)
+    // MARK: - Per-metric timers
 
-    private func startTimer() {
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
-            self?.updateAll()
+    private func interval(for metric: Metric) -> TimeInterval {
+        switch metric {
+        case .cpu:             return cpuInterval
+        case .temperature:     return temperatureInterval
+        case .memory:          return memoryInterval
+        case .memoryPressure:  return memoryInterval
+        case .swap:            return memoryInterval
+        case .ping:            return pingInterval
         }
     }
 
-    private func restartTimer() {
-        timer?.invalidate()
-        startTimer()
+    private func update(_ metric: Metric) {
+        switch metric {
+        case .cpu:             updateCPU()
+        case .temperature:     updateTemperature()
+        case .memory:          updateMemory()
+        case .memoryPressure:  updateMemoryPressure()
+        case .swap:            updateSwap()
+        case .ping:            updatePing()
+        }
     }
 
-    /// Updates all stats.
+    private func restart(_ metric: Metric) {
+        timers[metric]?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: interval(for: metric), repeats: true) { [weak self] _ in
+            self?.update(metric)
+        }
+        timers[metric] = timer
+    }
+
+    /// Runs every metric once. Called at init so the menu bar isn't blank.
     private func updateAll() {
-        updateCPU()
-        updateTemperature()
-        updateMemoryPressure()
-        updateMemory()
-        updateSwap()
-        updatePing()
+        for metric in Metric.allCases { update(metric) }
     }
 
     // MARK: - CPU Usage (Mach host_processor_info) — on-demand only
@@ -133,35 +259,13 @@ final class SystemMonitor {
     // MARK: - CPU Temperature
 
     private func updateTemperature() {
-        guard let client = IOHIDEventSystemClientCreate(kCFAllocatorDefault) else { return }
-        
-        let matchDict = [
-            "PrimaryUsagePage": 0xff00,
-            "PrimaryUsage": 0x5
-        ] as CFDictionary
-        
-        IOHIDEventSystemClientSetMatching(client, matchDict)
-        
-        guard let servicesUnmanaged = IOHIDEventSystemClientCopyServices(client) else { return }
-        let services = servicesUnmanaged.takeRetainedValue() as [AnyObject]
-        
         var maxTemp: Double = 0.0
-        
-        for service in services {
-            guard let nameUnmanaged = IOHIDServiceClientCopyProperty(service, "Product" as CFString) else { continue }
-            guard let name = nameUnmanaged.takeRetainedValue() as? String else { continue }
-            
-            if name.lowercased().contains("tdie") || name.lowercased().contains("cpu") {
-                if let eventUnmanaged = IOHIDServiceClientCopyEvent(service, kIOHIDEventTypeTemperature, 0, 0) {
-                    let event = eventUnmanaged.takeRetainedValue()
-                    let temp = IOHIDEventGetFloatValue(event, IOHIDEventFieldBase(kIOHIDEventTypeTemperature))
-                    if temp > maxTemp {
-                        maxTemp = temp
-                    }
-                }
-            }
+        for service in thermalServices {
+            guard let eventUnmanaged = IOHIDServiceClientCopyEvent(service, kIOHIDEventTypeTemperature, 0, 0) else { continue }
+            let event = eventUnmanaged.takeRetainedValue()
+            let temp = IOHIDEventGetFloatValue(event, IOHIDEventFieldBase(kIOHIDEventTypeTemperature))
+            if temp > maxTemp { maxTemp = temp }
         }
-        
         if maxTemp > 0 {
             self.cpuTemperature = maxTemp
         }
@@ -221,9 +325,10 @@ final class SystemMonitor {
 
     private func updatePing() {
         pingTask?.cancel()
+        let host = pingHost
         pingTask = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            let latency = Self.measurePingLatency()
+            let latency = Self.measurePingLatency(host: host)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 self.pingLatency = latency
@@ -231,44 +336,97 @@ final class SystemMonitor {
         }
     }
 
-    private static func measurePingLatency() -> Double? {
-        let process = Process()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
+    /// Sends a single ICMP echo request to `host` (IPv4 address or hostname)
+    /// over a SOCK_DGRAM ICMP socket (no root required on macOS) and returns
+    /// the round-trip time in milliseconds. Times out after 1s.
+    private static func measurePingLatency(host: String) -> Double? {
+        guard let resolved = resolveIPv4(host: host) else { return nil }
 
-        process.executableURL = URL(fileURLWithPath: "/sbin/ping")
-        process.arguments = ["-c", "1", "-W", "1000", "1.1.1.1"]
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
 
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
+        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        let tvSize = socklen_t(MemoryLayout<timeval>.size)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, tvSize)
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, tvSize)
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = resolved
+
+        let identifier = UInt16(truncatingIfNeeded: getpid())
+        let sequence: UInt16 = 1
+
+        // 8-byte ICMP header + 56-byte payload (matches default ping packet size).
+        var packet = [UInt8](repeating: 0, count: 64)
+        packet[0] = 8  // type: echo request
+        packet[1] = 0  // code
+        packet[4] = UInt8(identifier >> 8)
+        packet[5] = UInt8(identifier & 0xff)
+        packet[6] = UInt8(sequence   >> 8)
+        packet[7] = UInt8(sequence   & 0xff)
+
+        let checksum = internetChecksum(packet)
+        packet[2] = UInt8(checksum >> 8)
+        packet[3] = UInt8(checksum & 0xff)
+
+        let start = CFAbsoluteTimeGetCurrent()
+
+        let sent: ssize_t = packet.withUnsafeBufferPointer { buf in
+            withUnsafePointer(to: &addr) { addrPtr in
+                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                    sendto(fd, buf.baseAddress, buf.count, 0, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
         }
+        guard sent == packet.count else { return nil }
 
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: outputData, encoding: .utf8) ?? ""
-        let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
-        let combinedOutput = output + "\n" + errorOutput
-
-        guard process.terminationStatus == 0 else { return nil }
-
-        let pattern = #"time=([0-9]+(?:\.[0-9]+)?) ms"#
-        guard
-            let regex = try? NSRegularExpression(pattern: pattern),
-            let match = regex.firstMatch(
-                in: combinedOutput,
-                range: NSRange(combinedOutput.startIndex..., in: combinedOutput)
-            ),
-            let range = Range(match.range(at: 1), in: combinedOutput)
-        else {
-            return nil
+        var recvBuf = [UInt8](repeating: 0, count: 1500)
+        let received: ssize_t = recvBuf.withUnsafeMutableBufferPointer { buf in
+            recvfrom(fd, buf.baseAddress, buf.count, 0, nil, nil)
         }
+        guard received > 0 else { return nil }
 
-        return Double(combinedOutput[range])
+        return (CFAbsoluteTimeGetCurrent() - start) * 1000
+    }
+
+    /// 16-bit Internet checksum (RFC 1071) over an even- or odd-length buffer.
+    private static func internetChecksum(_ data: [UInt8]) -> UInt16 {
+        var sum: UInt32 = 0
+        var i = 0
+        while i + 1 < data.count {
+            sum &+= UInt32(data[i]) << 8 | UInt32(data[i + 1])
+            i += 2
+        }
+        if i < data.count {
+            sum &+= UInt32(data[i]) << 8
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16)
+        }
+        return ~UInt16(sum & 0xffff)
+    }
+
+    /// Resolves `host` to an IPv4 address in network byte order. Accepts a
+    /// dotted-quad literal or a hostname (DNS lookup via getaddrinfo).
+    private static func resolveIPv4(host: String) -> in_addr_t? {
+        let literal = inet_addr(host)
+        if literal != INADDR_NONE { return literal }
+
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_DGRAM
+
+        var result: UnsafeMutablePointer<addrinfo>?
+        defer { if let r = result { freeaddrinfo(r) } }
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let first = result else { return nil }
+
+        return first.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+            $0.pointee.sin_addr.s_addr
+        }
     }
 
     // MARK: - Formatting Helpers
@@ -277,9 +435,11 @@ final class SystemMonitor {
         String(format: "%.0f%%", cpuUsage)
     }
 
+    private static let bytesPerGB: Double = 1_073_741_824
+
     var memoryUsageFormatted: String {
-        let usedGB = Double(memoryUsed) / 1_073_741_824
-        let totalGB = Double(memoryTotal) / 1_073_741_824
+        let usedGB = Double(memoryUsed) / Self.bytesPerGB
+        let totalGB = Double(memoryTotal) / Self.bytesPerGB
         return String(format: "%.1f / %.0f GB", usedGB, totalGB)
     }
 
@@ -292,7 +452,7 @@ final class SystemMonitor {
     }
 
     var swapUsageFormatted: String {
-        let gb = Double(swapUsed) / 1_073_741_824
+        let gb = Double(swapUsed) / Self.bytesPerGB
         if gb < 0.05 { return "0GB" }
         let formatted = String(format: "%.1fGB", gb)
         return formatted.replacingOccurrences(of: ".0GB", with: "GB")

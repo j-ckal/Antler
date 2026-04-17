@@ -12,6 +12,11 @@ struct AntlerApp: App {
             Image(nsImage: menuBarImage())
         }
         .menuBarExtraStyle(.window)
+
+        Window("Antler Settings", id: "settings") {
+            SettingsView(monitor: monitor)
+        }
+        .windowResizability(.contentSize)
     }
 
     private func menuBarImage() -> NSImage {
