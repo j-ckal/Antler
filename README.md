@@ -6,6 +6,8 @@ Antler is a macOS menu bar app that shows:
 - Memory/swap usage and pressure
 - Network latency
 
+<img width="614" height="444" alt="image" src="https://github.com/user-attachments/assets/e6d6c572-3be2-4f85-a9f2-ea547d2809ed" />
+
 ## Requirements
 
 - An Apple Silicon mac
